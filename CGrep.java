@@ -1,4 +1,3 @@
-
 import java.util.concurrent.*;
 import java.util.regex.*;
 import java.util.ArrayList;
@@ -9,8 +8,16 @@ import java.io.*;
 import java.nio.*;
 import java.nio.channels.*;
 import java.nio.charset.*;
+import java.util.* ;
+
+import akka.actor.*;
 
 public class CGrep {
+	
+	// Actors and ActorSystem
+	static private ActorRef[] scanActors;
+    static private ActorRef collectionActor;
+    private static ActorSystem system = ActorSystem.create("MySystem");
     
     // Charset and decoder for ISO-8859-15
     final private static Charset charset = Charset.forName("ISO-8859-15");
@@ -105,19 +112,48 @@ public class CGrep {
 
         // Close the channel and the stream
         fc.close();
+        fis.close();
         
         //Return found object
         return found;
     }
+    
+    static class ScanActor extends UntypedActor {
+    	
+    	public void onReceive(Object message) {
+    		// Receive Configure, check if it's a file, and run grep
+    		String filename = ((Configure) message).getFile();
+    		File file = new File(filename);
+    		if (file.isFile())
+				try {
+					grep(file);
+				} catch (IOException e) {
+					e.printStackTrace();
+				}
+			else
+    			grep(filename);
+    	}
+    }
+    
+    static class CollectionActor extends UntypedActor {
+    	
+    	private int count;
+    	
+    	public void onReceive(Object message) {
+    		// Receive FileCount
+    		if (message instanceof FileCount)
+    			count = ((FileCount) message).getCount();
+    		// Receive Found and output
+    		else if (message instanceof Found) {
+    			((Found) message).printIndex();
+    			count--;
+    			if (count == 0)
+    				system.shutdown();
+    		}
+    	}
+    }
 
     public static void main(String[] args) {
-        final int NTHREADS = 3;
-        final ExecutorService es
-                = Executors.newFixedThreadPool(NTHREADS);
-        List<Future<Found>> list = new ArrayList<Future<Found>>();
-        boolean firstArg = true;
-        Future<Found> future;
-        
         // No arguments provided
         if (args.length < 2) {
             System.err.println("Usage: java Grep pattern file/String...");
@@ -126,50 +162,38 @@ public class CGrep {
 
         // Check for valid regex pattern
         compile(args[0]);
+        
+        // Create CollectionActor and start it
+        collectionActor = system.actorOf(Props.create(CollectionActor.class));
+        collectionActor.start();
 
-        // Check each subsequent arguement for files vs strings
-        for (final String arg : args) {
-            if (firstArg) {
-                firstArg = false; // Skip pattern argeument
-            } else {
-                if (new File(arg).isFile()) {
-                    // Perform string mining
-                    future = es.submit(new Callable<Found>() {
-                        @Override
-                        public Found call() throws Exception {
-                            File file = new File(arg);
-                            return grep(file);
-                        }
-                    });
-                    list.add(future);
-                } else {
-                    // Regular regex match
-                    future = es.submit(new Callable<Found>() {
-                        @Override
-                        public Found call() throws Exception {
-                            return grep(arg);                            
-                        }
-                    });
-                    list.add(future);
-                }
-            }
+        // Send FileCount message to CollectionActor
+        int count = 0;
+        ArrayList<Configure> configures = new ArrayList<Configure>();
+        for(int a = 1; a < args.length; a++) {
+        	if (new File(args[a]).isFile()) {
+        		count++;
+        		Configure config = new Configure(args[a], collectionActor);
+        		configures.add(config);
+        	}
         }
-
-        // Display Results
-        for (Future<Found> fut : list) {
-            try {
-                if(!fut.get().isEmpty())
-                {
-                   System.out.println("Found Match: " + fut.get().getName());
-                   fut.get().printIndex(); 
-                }                
-            } catch (InterruptedException | ExecutionException e) {
-                e.printStackTrace();
-            }
+        collectionActor.tell(new FileCount(count), collectionActor);
+        
+        
+        if (count == 0) { // Create ScanActor for standard input (no files)
+        	Configure config = new Configure(args[1], collectionActor);
+        	scanActors = new ActorRef[1];
+        	scanActors[0] = system.actorOf(Props.create(ScanActor.class));
+        	scanActors[0].start();
+        	scanActors[0].tell(config, collectionActor);
+        } else { // Create one ScanActor for each file, start it, and send each a Configure
+	        scanActors = new ActorRef[count];
+	        for(int b = 0; b < count; b++) {
+	        	scanActors[b] = system.actorOf(Props.create(ScanActor.class));
+	        	scanActors[b].start();
+	        	scanActors[b].tell(configures.get(b), collectionActor);
+	        }
         }
-
-        // When all jobs are complete, end the ExecutorService
-        es.shutdown();
 
     }
 
